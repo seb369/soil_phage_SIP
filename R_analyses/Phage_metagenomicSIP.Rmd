@@ -1,0 +1,1249 @@
+---
+title: "Phage metagenomic-SIP"
+author: "Sam Barnett"
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+output: 
+  github_document:
+    toc: true
+    toc_depth: 2
+---
+
+## Introduction
+
+In a previous study, we used metagenomic-SIP to identify 13C-labeled contigs in soil microcosms treated with 9 distinct carbon substrates. Here we expand upon those findings by examining the 13C-labeled viral populations (vOTUs). If a vOTU is 13C-labeled its host is likely an organism that assimilated C from the substrates and is therefore involved in soil carbon cycling in the microcosms. Thus, these vOTUs are themselves involved in the soil carbon cycle by potentially lysing these active organisms releasing their biomass into the soil organic matter pool.
+
+Here we will identify these vOTUs, examine their diversity, and attempt to identify bacterial hosts. The raw sequencing data, assembled contigs, and IMG annotations are available through the JGI genome portal under proposal 503502.
+
+### Initialization
+```{r, message=FALSE, warning=FALSE}
+# Libraries
+library(dplyr)
+library(ggplot2)
+library(grid)
+library(gridExtra)
+library(ggtext)
+library(knitr)
+
+
+
+# Legend extraction function
+g_legend<-function(a.gplot){
+  tmp <- ggplot_gtable(ggplot_build(a.gplot))
+  leg <- which(sapply(tmp$grobs, function(x) x$name) == "guide-box")
+  legend <- tmp$grobs[[leg]]
+  return(legend)}
+
+# Color scheme function from Paul Tol colors
+source("/home/sam/new_repo/paul_tol_colors.R")
+
+# Handy dataframes and lists including read depths and treatment name levels for ordering
+read.depths = data.frame(Microcosm = c("Control_Day1", "Control_Day6", "Control_Day14", "Control_Day30", "Control_Day48",
+                                       "Glucose_Day1", "Xylose_Day6", "Glucose_Day14", "Glycerol_Day14", 
+                                       "Cellulose_Day30", "PalmiticAcid_Day30", "PalmiticAcid_Day48", "Vanillin_Day48"),
+                         n_reads = c(600398782, 537771884, 778966874, 1279583274, 1326945180, 
+                                     818866782, 750644734, 662897402, 685015110, 707180514, 632500566, 602121814, 548508008))
+
+treat.read.depths = data.frame(Substrate = c("Glucose", "Xylose", "Glucose", "Glycerol", "Cellulose", "PalmiticAcid", "PalmiticAcid", "Vanillin"),
+                               Day = c(1, 6, 14, 14, 30, 30, 48, 48),
+                               n_reads = c(818866782, 750644734, 662897402, 685015110, 707180514, 632500566, 602121814, 548508008))
+
+treatment_levels = c("Glucose Day 1", "Xylose Day 6", "Glucose Day 14", "Glycerol Day 14", 
+                     "Cellulose Day 30", "Palmitic Acid Day 30", "Palmitic Acid Day 48", "Vanillin Day 48")
+
+```
+
+### Data import and merging
+
+#### FullCyc1 bacterial OTU data
+
+This data includes the assimilation and growth patterns of 13C-labeled bacterial OTUs from the original MW-HR-SIP study [LINK?]
+```{r, fig.width=7, fig.height=3.5, message=FALSE, warning=FALSE}
+# Dataframe for converting microcosm name into substrate and day
+treat_conversions = data.frame(Sub = c("13C-Glu", "13C-Xyl", "13C-Gly", "13C-Cel", "13C-Pal", "13C-Van", "13C-Oxa", "13C-Lac", "13C-Ami"),
+                               Substrate = c("Glucose", "Xylose", "Glycerol", "Cellulose", "PalmiticAcid", "Vanillin", "Oxalate", "Lactate", "AminoAcids"))
+
+
+# Import growth dynamic data
+DNA_yields.df = data.frame(Day = c(0, 1, 3, 6, 14, 30, 48),
+                           DNA_yield = c(11.152, 14.9336, 15.69485714, 16.95704, 15.47669333, 15.1208, 13.60342857))
+FullCyc1_growth.df = read.table("/home/sam/FullCyc_metagenome/phage_assembly/FullCyc_OTU_growth_dynamics.txt", sep="\t", header=TRUE, fill=TRUE) %>%
+  tidyr::gather(key = Day, value = abundance, -FG, -PC1, -OTU) %>%
+  mutate(Day = as.numeric(gsub("X", "", Day))) %>%
+  left_join(DNA_yields.df, by = "Day") %>%
+  mutate(norm_abundance = (abundance/100)*DNA_yield)
+
+# Importing the incorporator data
+treat_head = paste("treat", seq(1, 37), sep="_")
+FullCyc1_incorp.df = read.table("/home/sam/FullCyc_metagenome/phage_assembly/FullCyc_OTU_labeling.txt", sep="\t", header=TRUE, fill=TRUE, stringsAsFactors = FALSE) %>%
+  tidyr::separate(Substrate_incorp_on_day, into=c(treat_head), sep=",") %>%
+  tidyr::gather(key = "microcosm", value="value", -OTU, -FG, -PC1, -Phylum, -Class, -Order, -Family, -Genus, -Closest_cultivated) %>%
+  filter(!(is.na(value))) %>%
+  tidyr::separate(value, into=c("Sub", "Day"), sep="_D") %>%
+  mutate(Day = as.numeric(Day)) %>%
+  left_join(treat_conversions, by = "Sub") %>%
+  select(OTU, FG, Phylum, Class, Order, Family, Genus, Substrate, Day)
+
+# Get richeness (#) labeled OTU counts
+FullCyc1_incorp.sum = FullCyc1_incorp.df %>%
+  group_by(Substrate, Day) %>%
+  summarize(total_OTUs = n()) %>%
+  as.data.frame
+```
+
+#### Metagenomic-SIP
+
+Now lets get the metagenomic-SIP data and identify 13C-labeled contigs.
+
+##### Assembled contigs and their coverages
+Get all the contig coverages and match treatments and controls
+```{r, message=FALSE, warning=FALSE}
+# Contig coverages generated for metabat
+contig_cov.df = read.table("/home/sam/FullCyc_metagenome/binning_1000/metabat/FullCyc_1000_depths.txt",
+                           header=TRUE, sep="\t", stringsAsFactors = FALSE) %>%
+  mutate(Control_Day1 = Control_Day1_mapped.sorted.bam,
+         Control_Day6 = Control_Day6_mapped.sorted.bam, 
+         Control_Day14 = Control_Day14_mapped.sorted.bam,
+         Control_Day30 = Control_Day30_mapped.sorted.bam, 
+         Control_Day48 = Control_Day48_mapped.sorted.bam, 
+         Glucose_Day1  = Glucose_Day1_mapped.sorted.bam, 
+         Xylose_Day6 = Xylose_Day6_mapped.sorted.bam,
+         Glucose_Day14 = Glucose_Day14_mapped.sorted.bam, 
+         Glycerol_Day14 = Glycerol_Day14_mapped.sorted.bam,
+         Cellulose_Day30 = Cellulose_Day30_mapped.sorted.bam, 
+         PalmiticAcid_Day30 = PalmiticAcid_Day30_mapped.sorted.bam,
+         PalmiticAcid_Day48 = PalmiticAcid_Day48_mapped.sorted.bam, 
+         Vanillin_Day48 = Vanillin_Day48_mapped.sorted.bam) %>%
+  select(contigName, contigLen, Control_Day1, Control_Day6, Control_Day14, Control_Day30, Control_Day48, 
+         Glucose_Day1, Xylose_Day6, Glucose_Day14, Glycerol_Day14, 
+         Cellulose_Day30, PalmiticAcid_Day30, PalmiticAcid_Day48, Vanillin_Day48)
+
+# Coverage in control samples
+con_cov.df = contig_cov.df %>%
+  select(contigName, Control_Day1, Control_Day6, Control_Day14, Control_Day30, Control_Day48) %>%
+  tidyr::gather(key=Microcosm, value=Coverage, -contigName) %>%
+  left_join(read.depths, by="Microcosm") %>%
+  mutate(Control_coverage = (Coverage/n_reads)*500000000,
+         Day = as.numeric(as.character(gsub("Control_Day", "", Microcosm)))) %>%
+  select(contigName, Day, Control_coverage)
+
+# Coverage in treatment samples
+treat_cov.df = contig_cov.df %>%
+  select(contigName, Glucose_Day1, Xylose_Day6, Glucose_Day14, Glycerol_Day14, 
+         Cellulose_Day30, PalmiticAcid_Day30, PalmiticAcid_Day48, Vanillin_Day48) %>%
+  tidyr::gather(key=Microcosm, value=Coverage, -contigName) %>%
+  left_join(read.depths, by="Microcosm") %>%
+  mutate(Treatment_coverage = (Coverage/n_reads)*500000000) %>%
+  tidyr::separate(Microcosm, into=c("Substrate", "Day"), sep="_Day", convert=TRUE) %>%
+  select(contigName, Substrate, Day, Treatment_coverage)
+
+# Matching up treatment and control samples
+contig_cov_diff.df = full_join(treat_cov.df, con_cov.df, by=c("contigName", "Day")) %>%
+  filter(Treatment_coverage > 0 | Control_coverage > 0)
+
+# Contig length dataframe
+contig_lengths.df = select(contig_cov.df, contigName, contigLen)
+
+# Remove these giant files to save memory
+contig_cov.df = NULL
+treat_cov.df = NULL
+con_cov.df = NULL
+
+```
+
+##### Identify isotopically enriched contigs
+
+Now filter contigs to just those we propose are from labeled organisms (over 5X coverage in treatments and 1.5 fold increase in coverage between treatment and controls).
+
+```{r, fig.height=7, fig.width=7, message=FALSE, warning=FALSE}
+# Filter to just the enriched contigs
+enr_contigs.df = contig_cov_diff.df %>%
+  filter(Treatment_coverage > 5) %>%
+  mutate(FC_cov = Treatment_coverage/Control_coverage) %>%
+  filter(FC_cov > 1.5)
+
+# Remove the full dataframe to save memory
+contig_cov_diff.df = NULL
+
+# Get counts of enriched contigs
+enr_contigs.sum = enr_contigs.df %>%
+  group_by(Substrate, Day) %>%
+  summarize(n_contigs = n()) %>%
+  as.data.frame %>%
+  left_join(treat.read.depths, by = c("Substrate", "Day")) %>%
+  mutate(treatment = factor(paste(gsub("Acid", " Acid", Substrate), "Day", Day, sep=" "), levels = treatment_levels),
+         adj_n_contigs = (n_contigs/n_reads)*5000000)
+
+print(paste("There are", length(unique(enr_contigs.df$contigName)), "enriched contigs in total"))
+
+#write.table(enr_contigs.df, file = "/home/sam/FullCyc_metagenome/phage_assembly/labeled_contigs.txt", sep="\t", quote=FALSE, row.names = FALSE)
+
+```
+
+##### Genes from isotopically labeled contigs 
+Using the contig annotations from IMG I'll pull out the genes and annotations from the enriched contigs.
+
+```{r, message=FALSE, warning=FALSE}
+# Get table of gene annotations
+annotation_tbl = read.table("/home/sam/FullCyc_metagenome/annotation/IMG/Ga0334612_product_names.tsv", 
+                            sep="\t", quote="", header=FALSE, stringsAsFactors = FALSE) %>%
+  rename(geneID = V1, product = V2, prod_group = V3) %>%
+  #filter(product != "hypothetical protein") %>%
+  tidyr::separate(geneID, into=c("Project", "Scaffold", "start", "end"), sep="_", remove=FALSE) %>%
+  mutate(Scaffold = paste(Project, Scaffold, sep="_")) %>%
+  select(-Project)
+
+# Get mapping of contigs to IMG contig names
+contigs.df = read.table("/home/sam/FullCyc_metagenome/annotation/IMG/Ga0334612_contig_names_mapping.tsv", sep="\t", header=FALSE, stringsAsFactors = FALSE) %>%
+  rename(contigName = V1, Scaffold = V2) %>%
+  filter(Scaffold %in% unique(annotation_tbl$Scaffold))
+
+annotation.df = full_join(contigs.df, annotation_tbl, by = "Scaffold")
+annotation_tbl = NULL
+contigs.df = NULL
+
+# Match genes to enriched contigs and remove genes that are not proteins
+enr_genes.df = inner_join(annotation.df, enr_contigs.df, by="contigName") %>%
+  filter(!(prod_group %in% c("tRNA", "tmRNA", "ncRNA", "rRNA_5S", "rRNA_16S", "rRNA_23S", "rRNA_18S", "rRNA_28S")))
+annotation.df = NULL
+
+```
+
+
+## VirSorter results
+
+We used VirSorter to identify 13C-labeled contigs that may be from viruses. For quality, we use only virsorter categories 1 and 2. We also used BLASTn to align these contigs to cluster them into vOTU. None clustered therefore all contigs are non-overlapping viral populations (vOTUs).
+
+```{r, message=FALSE, warning=FALSE}
+virsorterfile = "/home/sam/FullCyc_metagenome/phage_assembly/virsorter_out/VIRSorter_global-phage-signal.csv"
+vs.pred <- read.csv(virsorterfile,quote="",head=F)
+vs.head <- read.table(virsorterfile,sep=",",quote="",head=T,comment="",skip=1,nrows=1)
+colnames(vs.pred) <- colnames(vs.head)
+colnames(vs.pred)[1] <- "vs.id"
+vs.cats <- do.call(rbind,strsplit(x=as.character(vs.pred$vs.id[grep("category",vs.pred$vs.id)]),split=" - ",fixed=T))[,2]
+vs.num <- grep("category",vs.pred$vs.id)
+vs.pred$Category <- paste(c("",rep.int(vs.cats, c(vs.num[-1],nrow(vs.pred)) - vs.num)), vs.pred$Category)
+vs.pred <- vs.pred[-grep("#",vs.pred$vs.id),]
+
+VirSorter_out_labeled.df = vs.pred %>%
+  mutate(contigName = gsub("VIRSorter_", "", vs.id)) %>%
+  filter(contigName %in% unique(enr_contigs.df$contigName)) %>%
+  left_join(contig_lengths.df, by = "contigName")
+
+#write.table(VirSorter_out_labeled.df, file = "/home/sam/FullCyc_metagenome/phage_assembly/labeled_phage_contigs.txt", sep="\t", quote=FALSE, row.names = FALSE)
+```
+
+### How does 13C-labeled vOTU richess compare to 13C-labeled bacterial OTU richess?
+
+```{r, fig.height=4, fig.width=4, message=FALSE, warning=FALSE}
+# Get vOTUs
+VirSorter_vOTUs.df = vs.pred %>%
+  mutate(contigName = gsub("VIRSorter_", "", vs.id)) %>%
+  inner_join(enr_contigs.df, by = "contigName") %>%
+  select(contigName, Nb.genes, Category, Nb.phage.hallmark.genes, Substrate, Day) %>%
+  left_join(contig_lengths.df, by = "contigName") %>%
+  filter(Category %in% c("Complete phage contigs 1", "Complete phage contigs 2"),
+         contigLen > 10000)
+
+print(paste("There are", length(unique(VirSorter_vOTUs.df$contigName)), "vOTUs"))
+
+# Summarize richness of vOTUs accounting for sequencing depth (# reads) and add bacterial OTU summary
+VirSorter_vOTUs.sum = VirSorter_vOTUs.df %>%
+  group_by(Substrate, Day) %>%
+  summarize(n_vOTUs = n()) %>%
+  as.data.frame %>%
+  left_join(treat.read.depths, by = c("Substrate", "Day")) %>%
+  mutate(adj_n_vOTUs = (n_vOTUs/n_reads)*100000000,
+         Treatment = factor(paste(gsub("Acid", " Acid", Substrate), "Day", Day), levels=treatment_levels)) %>%
+  left_join(FullCyc1_incorp.sum, by = c("Substrate", "Day")) %>%
+  mutate(adj_n_vOTUs_perOTU = adj_n_vOTUs/total_OTUs)
+
+# Plot
+vOTU_count.plot = ggplot(data=VirSorter_vOTUs.sum, aes(x=Treatment)) +
+  geom_text(y=1, aes(label=n_vOTUs), size=3) +
+  labs(y="# vOTUs") +
+  lims(y=c(0,2)) +
+  theme_bw() +
+  theme(axis.text = element_blank(),
+        axis.title.x = element_blank(),
+        axis.title.y = element_text(angle=0, vjust=0.5),
+        axis.ticks.y = element_blank(),
+        panel.grid = element_blank())
+
+vOTU_abundance.plot = ggplot(data=VirSorter_vOTUs.sum, aes(x=Treatment, y=adj_n_vOTUs)) +
+  geom_bar(stat="identity") +
+  labs(y="Adjusted labeled vOTU count") +
+  theme_bw() + 
+  theme(axis.text.x = element_text(angle=45, hjust=1))
+
+comb_vOTU_abundance.plot = cowplot::plot_grid(vOTU_count.plot, vOTU_abundance.plot, 
+                                              ncol=1, rel_heights = c(0.1, 1), align = "v")
+comb_vOTU_abundance.plot
+
+OTU_count.plot = ggplot(data=VirSorter_vOTUs.sum, aes(x=Treatment)) +
+  geom_text(y=1, aes(label=total_OTUs), size=3) +
+  labs(y="# OTUs") +
+  lims(y=c(0,2)) +
+  theme_bw() +
+  theme(axis.text = element_blank(),
+        axis.title.x = element_blank(),
+        axis.title.y = element_text(angle=0, vjust=0.5),
+        axis.ticks.y = element_blank(),
+        panel.grid = element_blank())
+
+vOTU_vs_OTU.plot = ggplot(data=VirSorter_vOTUs.sum, aes(x=Treatment, y=adj_n_vOTUs_perOTU)) +
+  geom_bar(stat="identity") +
+  labs(y="Labeled vOTUs per labeled OTU") +
+  theme_bw() + 
+  theme(axis.text.x = element_text(angle=45, hjust=1))
+
+comb_vOTU_vs_OTU.plot = cowplot::plot_grid(vOTU_count.plot, OTU_count.plot, vOTU_vs_OTU.plot, 
+                                              ncol=1, rel_heights = c(0.1, 0.1, 1), align = "v")
+comb_vOTU_vs_OTU.plot
+```
+
+Run the correlation between the two richnesses and make a figure. I'll add the figure to a composite figure a bit later.
+```{r, message=FALSE, warning=FALSE}
+vOTU_vs_bOTU.cor = cor.test(VirSorter_vOTUs.sum$adj_n_vOTUs, VirSorter_vOTUs.sum$total_OTUs)
+vOTU_vs_bOTU.cor
+
+vOTU_vs_bOTU.plot = ggplot(data=VirSorter_vOTUs.sum, aes(x=total_OTUs, y=adj_n_vOTUs)) +
+  geom_smooth(method="lm") +
+  geom_point()
+```
+
+## vConTACT2 Phage taxonomy
+
+We used vConTACT2 to cluster vOTUs and RefSeq viral genomes based on protein sharing in order to classify the vOTU
+
+### Make table to run
+First make the table of the vOTUs. This table is needed to run vConTACT2
+```{r, message=FALSE, warning=FALSE}
+vOTUs_4_vContact2.df = vs.pred %>%
+  mutate(contigName = gsub("VIRSorter_", "", vs.id)) %>%
+  filter(contigName %in% unique(enr_contigs.df$contigName)) %>%
+  left_join(contig_lengths.df, by = "contigName")%>%
+  filter(Category %in% c("Complete phage contigs 1", "Complete phage contigs 2"),
+         contigLen > 10000)
+#write.table(vOTUs_4_vContact2.df, file = "/home/sam/FullCyc_metagenome/phage_assembly/vOTUs_for_vContact2.txt", sep="\t", quote=FALSE, row.names = FALSE)
+```
+
+### View vOTU taxonomy
+
+vOTU taxonomy is based on co-clustered RefSeq genomes.
+```{r}
+ref_genomes.df = read.table("/home/sam/FullCyc_metagenome/phage_assembly/cOTU_Vcontact2_output/genome_by_genome_overview.csv", sep=",", header=TRUE, stringsAsFactors = FALSE)
+
+ref_tax.df = ref_genomes.df %>%
+  select(VC.Subcluster, Order, Family) %>%
+  filter(VC.Subcluster != "", Family != "Unassigned") %>%
+  unique
+
+vOTUs_vContact2.df = ref_genomes.df %>%
+  select(Genome, VC.Status, VC.Subcluster) %>%
+  filter(grepl("scaffold", Genome)) %>%
+  rename(contigName = Genome) %>%
+  left_join(ref_tax.df, by = "VC.Subcluster") %>%
+  select(contigName, Order, Family, VC.Status, VC.Subcluster) %>%
+  unique() %>%
+  mutate(Family = ifelse(VC.Subcluster == "", "Unclustered",
+                         ifelse(is.na(Family), "Unclassified cluster", Family)))
+```
+
+Vizualize the taxonomic diversity of the vOTU across treatments.
+```{r, fig.height=6, fig.width=5}
+# Write out the taxonomies
+print(paste("There are", nrow(vOTUs_vContact2.df), "vOTUs"))
+print(paste("There are", nrow(filter(vOTUs_vContact2.df, Family == "Unclustered", grepl("Singleton", VC.Status))), "unclustered Singleton vOTUs"))
+print(paste("There are", nrow(filter(vOTUs_vContact2.df, Family == "Unclustered", grepl("Outlier", VC.Status))), "unclustered Outlier vOTUs"))
+print(paste("There are", nrow(filter(vOTUs_vContact2.df, Family == "Unclustered", grepl("Overlap", VC.Status))), "unclustered Overlap vOTUs"))
+print(paste("There are", nrow(filter(vOTUs_vContact2.df, Family == "Unclassified cluster")), "unclassified but clustered vOTUs"))
+print(paste("There are", nrow(filter(vOTUs_vContact2.df, Family == "Myoviridae")), "Myoviridae vOTUs"))
+print(paste("There are", nrow(filter(vOTUs_vContact2.df, Family == "Podoviridae")), "Podoviridae vOTUs"))
+print(paste("There are", nrow(filter(vOTUs_vContact2.df, Family == "Siphoviridae")), "Siphoviridae vOTUs"))
+print(paste("There are", nrow(filter(vOTUs_vContact2.df, Family != "Unclustered")), "clustered vOTUs"))
+print(paste("There are", length(unique(filter(vOTUs_vContact2.df, VC.Subcluster != "")$VC.Subcluster)), "clusters"))
+
+# Set family colors
+taxa.col = c(paultol_colors(3), "#777777", "#FFFFFF")
+names(taxa.col) = c("Myoviridae", "Podoviridae", "Siphoviridae", "Unclassified", "Unclustered")
+
+# Summarize taxonomy across treatments
+vOTUs_vContact2.sum = vOTUs_vContact2.df %>%
+  left_join(enr_contigs.df, by = "contigName") %>%
+  group_by(Substrate, Day, Family) %>%
+  summarize(n_vOTUs = n()) %>%
+  as.data.frame %>%
+  left_join(treat.read.depths, by = c("Substrate", "Day")) %>%
+  mutate(adj_n_vOTUs = (n_vOTUs/n_reads)*100000000,
+         Treatment = factor(paste(gsub("Acid", " Acid", Substrate), "Day", Day), levels=treatment_levels)) %>%
+  left_join(FullCyc1_incorp.sum, by = c("Substrate", "Day")) %>%
+  mutate(adj_n_vOTUs_perOTU = adj_n_vOTUs/total_OTUs) %>%
+  group_by(Treatment) %>%
+  mutate(total_vOTUs = sum(n_vOTUs)) %>%
+  ungroup %>%
+  mutate(prop_vOTUs = n_vOTUs/total_vOTUs,
+         Family = factor(ifelse(Family == "Unclassified cluster", "Unclassified", Family),
+                         levels = c("Myoviridae", "Podoviridae", "Siphoviridae", "Unclassified", "Unclustered")))
+
+# vOTU richness plot (adjusted for sequencing depth)
+tax_count.plot = ggplot(data=vOTUs_vContact2.sum, aes(x=Treatment, y=Family)) +
+    geom_text(aes(label=n_vOTUs), size=3) +
+    theme_bw() +
+    theme(axis.text.x = element_blank(),
+          axis.title.x = element_blank(),
+          axis.title.y = element_blank(),
+          axis.ticks.y = element_blank(),
+          panel.grid = element_blank())
+
+vOTU_abundance_TAX.plot = ggplot(data=vOTUs_vContact2.sum, aes(x=Treatment, y=adj_n_vOTUs, fill=Family)) +
+  geom_bar(stat="identity", color="black", size=0.1) +
+  labs(y="Adjusted count of labeled vOTUs") + 
+  scale_fill_manual(values=taxa.col) +
+  theme_bw() + 
+  theme(axis.text.x = element_text(angle=45, hjust=1))
+
+combo_vOTU_abundance_TAX.plot = cowplot::plot_grid(tax_count.plot, vOTU_abundance_TAX.plot, 
+                                              ncol=1, rel_heights = c(0.2, 1), align = "v", axis = "lr")
+combo_vOTU_abundance_TAX.plot
+
+# vOTUs per bacterial OTU
+vOTU_vs_OTU_TAX.plot = ggplot(data=vOTUs_vContact2.sum, aes(x=Treatment, y=adj_n_vOTUs_perOTU, fill=Family)) +
+  geom_bar(stat="identity", color="black", size=0.1) +
+  labs(y="Labeled vOTUs per OTU") +
+  scale_fill_manual(values=taxa.col) +
+  theme_bw() + 
+  theme(axis.text.x = element_text(angle=45, hjust=1))
+vOTU_vs_OTU_TAX.plot
+
+# Proportion of 13C-labeled vOTU from each Family
+vOTU_prop_TAX.plot = ggplot(data=vOTUs_vContact2.sum, aes(x=Treatment, y=prop_vOTUs, fill=Family)) +
+  geom_bar(stat="identity", color="black", size=0.1) +
+  labs(y="Proportion of labeled clustered vOTUs") + 
+  scale_fill_manual(values=taxa.col) +
+  theme_bw() + 
+  theme(axis.text.x = element_text(angle=45, hjust=1))
+vOTU_prop_TAX.plot
+```
+
+Make second half of vOTU figure for publication
+
+```{r, fig.height=5, fig.width=2}
+tax_count.plot = ggplot(data=vOTUs_vContact2.sum, aes(x=Treatment, y=Family)) +
+    geom_text(aes(label=n_vOTUs), size=6*5/14) +
+    theme_bw() +
+    theme(axis.text.x = element_blank(),
+          axis.text.y = element_text(size=7),
+          axis.title.x = element_blank(),
+          axis.title.y = element_blank(),
+          axis.ticks.y = element_blank(),
+          panel.grid = element_blank(),
+          plot.margin = margin(5,0,0,0, unit="mm"))
+
+vOTU_abundance_TAX.plot = ggplot(data=vOTUs_vContact2.sum, aes(x=Treatment, y=adj_n_vOTUs, fill=Family)) +
+  geom_bar(stat="identity", color="black", size=0.1) +
+  labs(y="Relative richness of<br><sup>13</sup>C-labeled vOTU") + 
+  scale_fill_manual(values=taxa.col) +
+  theme_bw() + 
+  theme(axis.text.x = element_text(angle=45, hjust=1, size=7),
+        axis.text.y = element_text(size=7),
+        axis.title.x = element_text(size=8),
+        axis.title.y = element_markdown(size=8),
+        panel.grid.major.x = element_blank(),
+        legend.position = "none",
+        plot.margin = margin(0,2,0,0, unit="mm"))
+
+combo_vOTU_abundance_TAX.plot = cowplot::plot_grid(tax_count.plot, vOTU_abundance_TAX.plot, 
+                                              ncol=1, rel_heights = c(0.3, 1), align = "v", axis = "lr")
+
+vOTU_vs_bOTU.plot = ggplot(data=VirSorter_vOTUs.sum, aes(x=total_OTUs, y=adj_n_vOTUs)) +
+  geom_smooth(method="lm", color="red", fill="red") +
+  geom_point(size=2, color="black", shape=21, fill="white") +
+  labs(x="Richness of <sup>13</sup>C-labeled<br>bacterial OTU<sub>rRNA</sub>",
+       y="Relative richness of<br><sup>13</sup>C-labeled vOTU") +
+  theme_bw() +
+  theme(axis.text = element_text(size=7),
+        axis.title.x = element_markdown(size=8),
+        axis.title.y = element_markdown(size=8),
+        legend.position = "none",
+        plot.margin = margin(5,2,2,0, unit="mm"))
+
+
+fig1bc.plot = cowplot::plot_grid(combo_vOTU_abundance_TAX.plot, vOTU_vs_bOTU.plot, ncol=1,
+                                 rel_heights = c(1, 0.5), labels=c("B", "C"), label_size = 9)
+fig1bc.plot
+```
+
+### Vcontact2 protein sharing network
+
+Next, vizualize the protein sharing network. To simplify, only include references with some connection to the vOTU.
+
+```{r}
+# Read in the network 
+cytoscape_full.nwk = read.table("/home/sam/FullCyc_metagenome/phage_assembly/cOTU_Vcontact2_output/c1.ntw", sep=" ")
+
+# Get only references with some connection to vOTU. To to this, I'll first select all vOTU, then all genomes connected to a vOTU, then all genomes connected to those genomes and so on untill no new genomes are added. Should take about six rounds of connections.
+subset1 = cytoscape_full.nwk %>%
+  filter(grepl("scaffold", V1) | grepl("scaffold", V2)) %>%
+  tidyr::gather(key="vertx", value="Genome", -V3) %>%
+  select(Genome) %>%
+  unique
+
+subset2 = cytoscape_full.nwk %>%
+  filter(V1 %in% subset1$Genome | V2 %in% subset1$Genome) %>%
+  tidyr::gather(key="vertx", value="Genome", -V3) %>%
+  select(Genome) %>%
+  unique
+
+subset3 = cytoscape_full.nwk %>%
+  filter(V1 %in% subset2$Genome | V2 %in% subset2$Genome) %>%
+  tidyr::gather(key="vertx", value="Genome", -V3) %>%
+  select(Genome) %>%
+  unique
+
+subset4 = cytoscape_full.nwk %>%
+  filter(V1 %in% subset3$Genome | V2 %in% subset3$Genome) %>%
+  tidyr::gather(key="vertx", value="Genome", -V3) %>%
+  select(Genome) %>%
+  unique
+
+subset5 = cytoscape_full.nwk %>%
+  filter(V1 %in% subset4$Genome | V2 %in% subset4$Genome) %>%
+  tidyr::gather(key="vertx", value="Genome", -V3) %>%
+  select(Genome) %>%
+  unique
+
+subset6 = cytoscape_full.nwk %>%
+  filter(V1 %in% subset5$Genome | V2 %in% subset5$Genome) %>%
+  tidyr::gather(key="vertx", value="Genome", -V3) %>%
+  select(Genome) %>%
+  unique
+
+subset7 = cytoscape_full.nwk %>%
+  filter(V1 %in% subset6$Genome | V2 %in% subset6$Genome) %>%
+  tidyr::gather(key="vertx", value="Genome", -V3) %>%
+  select(Genome) %>%
+  unique
+
+cytoscape_subset.df = ref_genomes.df %>%
+  filter(Genome %in% subset6$Genome)
+
+cytoscape_subset.nwk = cytoscape_full.nwk %>%
+  filter(V1 %in% subset6$Genome,
+         V2 %in% subset6$Genome)
+
+```
+
+Plot the network. Note that each time this is run, the network diagram may look different due to the stochasticity in figure generation.
+```{r, fig.height=5, fig.width=5}
+library(ggnetwork)
+library(network)
+
+taxa.col = c(paultol_colors(5), "#777777", "#FFFFFF")
+names(taxa.col) = c("Myoviridae", "Ackermannviridae", "Herelleviridae", "Podoviridae", "Siphoviridae", "Unassigned", "vOTU")
+
+# Get edges
+edges = cytoscape_subset.nwk %>%
+#edges = cytoscape_full.nwk %>%
+  mutate(from = as.character(V1), to = as.character(V2), weight = V3) %>%
+  select(from, to, weight) %>%
+  arrange(weight)
+
+edge_pair = c()
+for (i in 1:nrow(edges)){
+  from_to = c(edges[i,1], edges[i, 2])
+  edge_pair[i] = paste(from_to[order(from_to)], collapse = " ")
+}
+edges$edge_pair = edge_pair
+edge_pair_derep = edges %>%
+  group_by(edge_pair) %>%
+  mutate(rank = row_number()) %>%
+  ungroup %>%
+  filter(rank == 1) %>%
+  select(from, to, weight)
+
+# Make network
+vOTU.network = network(edge_pair_derep, directed=FALSE, matrix.type="edgelist")
+vOTU.ggnet = ggnetwork(vOTU.network)
+
+# Add vertex info
+vOTU_info.ggnet = cytoscape_subset.df %>%
+  rename(vertex.names=Genome) %>%
+  mutate(node_type = ifelse(grepl("scaffold", vertex.names), "vOTU", "Reference"),
+         Taxa = ifelse(grepl("scaffold", vertex.names), "vOTU", Family)) %>%
+  inner_join(vOTU.ggnet, by = "vertex.names")
+
+vOTU_info.text = vOTU_info.ggnet %>%
+  select(VC.Subcluster, x, y) %>%
+  group_by(VC.Subcluster) %>%
+  summarize(x = mean(x),
+            y = mean(y)) %>%
+  ungroup %>%
+  arrange(VC.Subcluster) %>%
+  mutate(cluster_ID = row_number())
+
+# Plot
+vContact2_network.plot = ggplot(vOTU_info.ggnet, aes(x = x, y = y)) +
+  geom_edges(aes(xend = xend, yend = yend), color="grey", size=0.25) +
+  geom_nodes(data = filter(vOTU_info.ggnet, node_type == "Reference"),
+             aes(fill=Taxa), shape=21, size=1) +
+  geom_nodes(data = filter(vOTU_info.ggnet, node_type == "vOTU"),
+             aes(fill=Taxa), shape=21, size=1) +
+  scale_fill_manual(values=taxa.col) +
+  labs(size="Node type", shape="Node type", fill="Family", alpha="Score") +
+  theme_bw() +
+  theme(axis.text = element_blank(),
+        axis.title = element_blank(),
+        axis.ticks = element_blank(),
+        legend.text = element_text(size=7),
+        legend.title= element_blank(),
+        legend.position = "bottom",
+        legend.margin = margin(t=-5, unit="mm"), 
+        panel.grid = element_blank(),
+        panel.border = element_blank()) +
+  guides(fill=guide_legend(override.aes = list(size=3), nrow=2, title.position = "top"))
+
+vContact2_network.plot
+```
+
+### Make composite taxonomy figure for publication
+```{r, fig.height=5, fig.width=7.08661}
+fig1.plot = cowplot::plot_grid(vContact2_network.plot, fig1bc.plot, ncol=2,
+                               rel_widths = c(5, 2), labels=c("A", ""), label_size = 9)
+fig1.plot
+
+#ggsave(fig1.plot, filename = "/home/sam/FullCyc_metagenome/phage_assembly/Figs4Publication/Fig1.tiff", 
+#       device = "tiff", width = 7.08661, height = 5, units = "in")
+```
+
+## Matching vOTU to hosts
+
+We will attempt three methods to link vOTUs to hosts within the soils.
+
+### BLASTn to RefSeq results
+Do any viral contigs map to RefSeq viral sequences (>10,000 bp long, >95% identity over 85% of the contig)?
+```{r, message=FALSE, warning=FALSE}
+blastout.df = read.table("/home/sam/FullCyc_metagenome/phage_assembly/labeled_phage_RefSeq_blastout.txt", header=FALSE, sep="\t", stringsAsFactors = FALSE)
+colnames(blastout.df) = c("query_ID", "ref_ID", "perc_identity", "align_length", "mismatchs", "gaps", "qstart", "qend", "sstart", "send", "evalue", "bitscore")
+
+kable(blastout.df %>%
+        filter(query_ID != ref_ID) %>%
+        rename(contigName = query_ID) %>%
+        left_join(contig_lengths.df, by = "contigName") %>%
+        mutate(perc_cov = (align_length/contigLen)*100) %>%
+        filter(perc_cov > 85, perc_identity > 95))
+
+```
+
+No, the only one with >95% identity over 85% of the contig was only ~5,200 bp long :( 
+
+### CRISPR vs. vOTUs BLASTn 
+Do any vOTU match CRIPR spacers within this same metagenome (100% identity over entire CRISPR spacer)? If so, then it is likely the host of the CRISPR array is the host of the vOTU (or close relatives).
+
+```{r, message=FALSE, warning=FALSE}
+crisper_spacers.df = read.table("/home/sam/FullCyc_metagenome/annotation/IMG/Ga0334612_crt.crisprs", header=FALSE, sep="\t", stringsAsFactors = FALSE)
+colnames(crisper_spacers.df) = c("Scaffold", "CRISPR_number", "Position", "Repeat", "Spacer", "c")
+crisper_spacers.df = crisper_spacers.df %>%
+  mutate(Spacer_ID = paste(Scaffold, "_pos", Position, sep=""),
+         Spacer_len = nchar(Spacer))
+
+crispr_blastout.df = read.table("/home/sam/FullCyc_metagenome/phage_assembly/CRISPR_blastout.txt", header=FALSE, sep="\t", stringsAsFactors = FALSE)
+colnames(crispr_blastout.df) = c("Spacer_ID", "Phage_ID", "perc_identity", "align_length", "mismatchs", "gaps", "qstart", "qend", "sstart", "send", "evalue", "bitscore")
+
+scaff2cont = read.table("/home/sam/FullCyc_metagenome/annotation/IMG/Ga0334612_contig_names_mapping.tsv", sep="\t", header=FALSE, stringsAsFactors = FALSE) %>%
+  rename(contigName = V1, Scaffold = V2) %>%
+  filter(Scaffold %in% unique(crisper_spacers.df$Scaffold))
+
+kable(crispr_blastout.df %>%
+        left_join(crisper_spacers.df, by = "Spacer_ID") %>%
+        filter(align_length == Spacer_len) %>%
+        left_join(scaff2cont) %>%
+        left_join(rename(contig_lengths.df, Phage_ID = contigName, PhageLen = contigLen), by = "Phage_ID") %>%
+        select(Spacer_ID, Scaffold, contigName, Phage_ID, PhageLen, perc_identity, Repeat, Spacer) %>%
+        filter(contigName != Phage_ID) %>%
+        mutate(Labeled_contig = ifelse(contigName %in% unique(enr_contigs.df$contigName), "Labeled", "Unlabeled"),
+               Labeled_phage = ifelse(Phage_ID %in% unique(enr_contigs.df$contigName), "Labeled", "Unlabeled"),
+               vOTU = ifelse(Phage_ID %in% VirSorter_vOTUs.df$contigName, "vOTU", "non vOTU")))
+
+```
+
+### BLAST labeled contigs for host
+
+MAGs were generated using the labeled contigs, therefore to try to match vOTUs to MAG hosts we will blast across all labeled contigs (>70% identity over a >2500 bp alignment).
+
+```{r, message=FALSE, warning=FALSE}
+labeled_blastout.df = read.table("/home/sam/FullCyc_metagenome/phage_assembly/labeled_phage_labeled_contig_blastout.txt", header=FALSE, sep="\t", stringsAsFactors = FALSE)
+colnames(labeled_blastout.df) = c("query_ID", "ref_ID", "perc_identity", "align_length", "mismatchs", "gaps", "qstart", "qend", "sstart", "send", "evalue", "bitscore")
+
+scaff2cont = read.table("/home/sam/FullCyc_metagenome/annotation/IMG/Ga0334612_contig_names_mapping.tsv", sep="\t", header=FALSE, stringsAsFactors = FALSE) %>%
+  rename(contigName = V1, Scaffold = V2) %>%
+  filter(contigName %in% unique(labeled_blastout.df$ref_ID))
+
+enr_gene_tax.df = read.table("/home/sam/FullCyc_metagenome/annotation/IMG/Ga0334612_gene_phylogeny.tsv", 
+           sep="\t", quote="", header=FALSE, stringsAsFactors = FALSE) %>%
+  rename(geneID = V1, Taxonomy = V5) %>%
+  right_join(enr_genes.df, by="geneID") %>%
+  tidyr::separate(Taxonomy, into=c("Domain", "Phylum", "Class", "Order", "Family", "Genus", "Species", "Strain"), sep=";")
+
+enr_gene_tax_short.df = enr_gene_tax.df %>%
+  select(contigName, geneID, Domain, Phylum, Class, Order, Family, Genus, Species, product) %>%
+  unique()
+
+vs_categories = vs.pred %>%
+  mutate(contigName = gsub("VIRSorter_", "", vs.id)) %>%
+  filter(contigName %in% unique(enr_contigs.df$contigName)) %>%
+  select(contigName, Category)
+
+# Filter to just the appropriately matching alignment criteria
+matching_labeled_blastout.df = labeled_blastout.df %>%
+  filter(query_ID != ref_ID) %>%
+  rename(vOTU = query_ID,
+         contigName = ref_ID) %>%
+  filter(perc_identity > 70, align_length > 2500) %>%
+  left_join(rename(contig_lengths.df, vOTU = contigName, vOTU_length = contigLen), by = "vOTU") %>%
+  left_join(scaff2cont, by = "contigName") %>%
+  left_join(vs_categories, by = "contigName")
+
+# Show the vOTUs with matching contigs
+kable(matching_labeled_blastout.df %>%
+        filter(!(Category %in% c("Complete phage contigs 1", "Complete phage contigs 2")), vOTU_length > 10000) %>%
+        arrange(vOTU))
+```
+
+Match the vOTU aligned contigs with MAGs
+```{r, message=FALSE, warning=FALSE}
+# Get list of contigs from each bin
+treatment.list = c("Glucose_Day01", "Xylose_Day06", "Glucose_Day14", "Glycerol_Day14", 
+                   "Cellulose_Day30", "PalmiticAcid_Day30", "PalmiticAcid_Day48", "Vanillin_Day48")
+bins.df = data.frame()
+for (treat in treatment.list){
+  bin_file = paste("/home/sam/FullCyc_metagenome/enriched_binning/", treat, "/", treat, "_metaWRAP_refinement/metawrap_50_10_bins.contigs", sep="")
+  sub.bins = read.table(bin_file, sep="\t", header=FALSE, stringsAsFactors = FALSE) %>%
+    rename(contigName = V1, BinID = V2) %>%
+    mutate(Bin_treatment = treat,
+           Bin_number = BinID) %>%
+    mutate(BinID = paste(Bin_treatment, Bin_number, sep="_"))
+  bins.df = rbind(bins.df, sub.bins)
+  sub.bins = NULL
+}
+
+kable(matching_labeled_blastout.df %>%
+        filter(!(Category %in% c("Complete phage contigs 1", "Complete phage contigs 2")),
+               vOTU_length > 10000) %>%
+        arrange(vOTU) %>%
+        left_join(bins.df, by = "contigName") %>%
+        filter(!(is.na(BinID))))
+
+```
+
+No vOTU aligns with contigs from MAGs.
+
+## Host OTU abundance (Streptomyces)
+One vOTU was matched with a host, scaffold_15_c1 matched with a Streptomyces CRISPR array. Now lets look at the normalized abundance of all 13C-labeled Streptomyces OTUs across the microcosms
+
+```{r, fig.height=5, fig.width=7}
+## Abundance of Streptomyces incorporators
+FullCyc1_incorp.streptomyces = FullCyc1_incorp.df %>%
+  filter(Family == "Streptomyces") %>%
+  select(OTU, FG, Phylum, Class, Order, Family, Genus) %>%
+  unique
+
+FullCyc1_growth_strepto.sum = FullCyc1_growth.df %>%
+  inner_join(FullCyc1_incorp.streptomyces, by = "OTU")
+
+Allstrep_OTUs.plot = ggplot(data=FullCyc1_growth_strepto.sum, aes(x=Day, y=norm_abundance)) +
+  geom_area(aes(fill=OTU)) +
+  scale_fill_manual(values = paultol_colors(length(unique(FullCyc1_growth_strepto.sum$OTU)))) +
+  theme_bw()
+
+Allstrep_OTUs.plot
+
+```
+
+### 13C-labeling and abundance plot
+Now lets make a plot containing both the 13C-labeling of Streptomyces and vOTU and the abundance of the streptomyces together to better compare their relationship.
+
+```{r, fig.height=4, fig.width=7.08661}
+#vOTU scaffold_15_c1	matches CRIPSR spacers on contig scaffold_5665499_c1 which is an unlabeled streptomyces acording to IMG
+
+Streptomyces_phage_contigs_labeling.df = filter(enr_contigs.df, contigName == "scaffold_15_c1") %>%
+  mutate(Substrate = gsub("Acid", " Acid", Substrate)) %>%
+  mutate(Substrate = factor(Substrate, levels=c("Glucose", "Xylose", "Amino Acids", "Glycerol", "Lactate", "Oxalate", "Vanillin", "Cellulose", "Palmitic Acid"))) %>%
+  select(Substrate, Day, contigName) %>%
+  arrange(Substrate, Day)
+
+Labeled_Streptomyces.sum = FullCyc1_incorp.df %>% 
+  filter(Family == "Streptomyces") %>%
+  group_by(Substrate, Day) %>%
+  summarize(n_OTUs = n()) %>%
+  as.data.frame %>%
+  mutate(Substrate = gsub("Acid", " Acid", Substrate)) %>%
+  mutate(Substrate = factor(Substrate, levels=c("Glucose", "Xylose", "Amino Acids", "Glycerol", "Lactate", "Oxalate", "Vanillin", "Cellulose", "Palmitic Acid")))
+  
+Streptomyces_growth.sum = FullCyc1_growth.df %>%
+  filter(OTU %in% unique(filter(FullCyc1_incorp.df, Family == "Streptomyces")$OTU)) %>%
+  group_by(Day) %>%
+  summarize(sum_norm_abd = sum(norm_abundance)) %>%
+  as.data.frame
+
+meta_SIP_days.df = data.frame(Day = c(1, 6, 14, 14, 30, 30, 48, 48),
+                              Substrate = c("Glucose", "Xylose", "Glucose", "Glycerol", "Cellulose", "Palmitic Acid", "Palmitic Acid", "Vanillin"))
+
+MWHRSIP_sampled.df = rbind(data.frame(Substrate = "Glucose", Day = c(1,3,6,14)),
+                           data.frame(Substrate = "Xylose", Day = c(1,3,6,14)),
+                           data.frame(Substrate = "Amino Acids", Day = c(1,3,6,14)),
+                           data.frame(Substrate = "Glycerol", Day = c(1,3,6,14)),
+                           data.frame(Substrate = "Lactate", Day = c(1,3,6)),
+                           data.frame(Substrate = "Oxalate", Day = c(3,6,14)),
+                           data.frame(Substrate = "Vanillin", Day = c(6,14,30,48)),
+                           data.frame(Substrate = "Cellulose", Day = c(3,6,14,30,48)),
+                           data.frame(Substrate = "Palmitic Acid", Day = c(6,14,30,48))) %>%
+    mutate(Substrate = factor(Substrate, levels=c("Glucose", "Xylose", "Amino Acids", "Glycerol", "Lactate", "Oxalate", "Vanillin", "Cellulose", "Palmitic Acid")))
+
+Labeled_Streptomyces.plot = ggplot(data=Labeled_Streptomyces.sum, aes(x=Day, y=Substrate)) +
+  geom_point(aes(size=n_OTUs)) +
+  geom_point(data=MWHRSIP_sampled.df, shape=0, size=7, color="black") +
+  geom_point(data=Streptomyces_phage_contigs_labeling.df, shape=15, size=7, color="yellow") +
+  geom_point(data=meta_SIP_days.df, shape=0, size=7, color="red",stroke = 2) +
+  geom_point(aes(size=n_OTUs)) +
+  annotate("segment", x=30, y=8.5, xend=15, yend=9, size=0.5, color="red") +
+  annotate("segment", x=35, y=7.5, xend=31, yend=2, size=0.5, color="red") +
+  annotate("segment", x=20, y=6, xend=15, yend=6, size=0.5, color="red") +
+  annotate("segment", x=20, y=4, xend=15, yend=4, size=0.5, color="black") +
+  annotate("richtext", x=35, y=8.5, label="<sup>13</sup>C-labeling detected<br>for vOTU in microcosm<br>used for metagenomic-SIP", size=7*5/14, fill="yellow", color="red") +
+  annotate("richtext", x=25, y=6, label="Microcosm used for metagenomic-SIP<br>(no labeling detected for vOTU)", size=7*5/14, fill="white", color="red") +
+  annotate("richtext", x=22, y=4, label="Microcosm used for<br>MW-HR-SIP", size=7*5/14, fill="white", color="black") +
+  lims(x= c(0,50)) +
+  labs(x="Time since C addition (days)", y="<sup>13</sup>C-labeled C source", size="Number of <sup>13</sup>C-labeled<br>*Streptomyces* OTU<sub>rRNA</sub>") +
+  scale_y_discrete(limits = rev(levels(Labeled_Streptomyces.sum$Substrate))) +
+  scale_size_continuous(breaks = c(3, 6, 12)) +
+  theme_bw() +
+  theme(axis.title.y = element_markdown(size=8),
+        axis.text.y = element_text(size=7),
+        axis.text.x = element_blank(),
+        axis.title.x = element_blank(),
+        legend.title = element_markdown(size=7),
+        legend.text = element_text(size=7),
+        legend.position = c(0.89, 0.67),
+        legend.direction = "vertical",
+        legend.background = element_blank(),
+        legend.box.background = element_rect(colour = "black")) +
+  guides(size = guide_legend(title.position="top", title.hjust = 0.5))
+
+Streptomyces_growth.plot = ggplot(data=Streptomyces_growth.sum, aes(x=Day, y=sum_norm_abd)) +
+  geom_line() +
+  geom_point(size=2, color="black", shape=21, fill="white") +
+  labs(x="Time since C addition (days)", y="Normalized abundance<br>of <sup>13</sup>C-labeled<br>*Streptomyces* OTU<sub>rRNA</sub>") +
+  lims(x= c(0,50), y=c(0,0.26)) +
+  theme_bw() +
+  theme(axis.title.x = element_text(size=8),
+        axis.title.y = element_markdown(size=8),
+        axis.text = element_text(size=7))
+
+fig2.plot = cowplot::plot_grid(Labeled_Streptomyces.plot, Streptomyces_growth.plot, nrow=2, rel_heights = c(1, 0.8), align = "v", axis = "lr", labels = c("A", "B"), label_size = 9)
+fig2.plot
+
+
+#ggsave(fig2.plot, filename = "/home/sam/FullCyc_metagenome/phage_assembly/Figs4Publication/Fig2.tiff", 
+#       device = "tiff", width = 7.08661, height = 4, units = "in")
+```
+
+Make a second figure where the different streptomyces OTUs are represented in the abundance.
+
+```{r, fig.height=4, fig.width=7.08661}
+Streptomyces_growth.df = FullCyc1_growth.df %>%
+  filter(OTU %in% unique(filter(FullCyc1_incorp.df, Family == "Streptomyces")$OTU))
+
+alt_Streptomyces_growth.plot = ggplot(data=Streptomyces_growth.sum, aes(x=Day, y=sum_norm_abd)) +
+  geom_area(data=Streptomyces_growth.df, aes(fill=OTU, y=norm_abundance)) +
+  geom_line() +
+  geom_point(size=2, color="black", shape=21, fill="white") +
+  scale_fill_manual(values = paultol_colors(length(unique(Streptomyces_growth.df$OTU)))) +
+  labs(x="Time since C addition (days)", y="Normalized abundance<br>of <sup>13</sup>C-labeled<br>*Streptomyces* OTU<sub>rRNA</sub>") +
+  lims(x= c(0,50), y=c(0,0.26)) +
+  theme_bw() +
+  theme(axis.title.x = element_text(size=8),
+        axis.title.y = element_markdown(size=8),
+        axis.text = element_text(size=7),
+        legend.position = "none")
+
+altfig2.plot = cowplot::plot_grid(Labeled_Streptomyces.plot, alt_Streptomyces_growth.plot, nrow=2, rel_heights = c(1, 0.8), align = "v", axis = "lr", labels = c("A", "B"), label_size = 9)
+altfig2.plot
+
+#ggsave(altfig2.plot, filename = "/home/sam/FullCyc_metagenome/phage_assembly/Figs4Publication/Fig2.tiff", 
+#       device = "tiff", width = 7.08661, height = 4, units = "in")
+     
+```
+
+## vOTU SNPs and base-by-base coverage
+
+For making the primer-probe set for qPCR we need to look at the genetic diversity in the vOTU contig and make sure that our primers or probe do not overlap with a region that has high diversity in the reads. Otherwise we might miss par of the populations.
+
+### Base-by-base coverage across treatments
+
+Lets look at the read coverage of the contig in each treatment.
+
+```{r, fig.width=7, fig.height=7}
+BbB_cov.df = read.table("/home/sam/FullCyc_metagenome/phage_assembly/SNP_finding/scaffold_15_c1_BbBcov.txt", 
+                        header=FALSE, sep="\t", comment.char = "", quote = "", stringsAsFactors = FALSE)
+
+snp_header = c("vOTU", "position", "ID", "Consensus_base", "SNP_base", "Quality", "Filter", "INFO", "FORMAT", as.character(read.depths$Microcosm))
+SNPs.df = read.table("/home/sam/FullCyc_metagenome/phage_assembly/SNP_finding/scaffold_15_c1_calls_filtered.vcf", header=FALSE, sep="\t", comment.char = "#", stringsAsFactors = FALSE)
+colnames(SNPs.df) = snp_header
+SNPs.long = SNPs.df %>%
+  select(-ID, -Filter, -INFO, -FORMAT) %>%
+  tidyr::gather(key="Microcosm", value = "SNP_format", -vOTU, -position, -Consensus_base, -SNP_base, -Quality) %>%
+  tidyr::separate(SNP_format, into=c("SNP", "SNP_qual"), sep=":")
+
+min_headers = c("vOTU", "position", "base", as.character(read.depths$Microcosm))
+min_BbB_cov.df = BbB_cov.df %>%
+  select(V1, V2, V3, V4, V7, V10, V13, V16, V19, V22, V25, V28, V31, V34, V37, V40)
+colnames(min_BbB_cov.df) = min_headers
+
+min_BbB_cov.sum = min_BbB_cov.df %>%
+  tidyr::gather(key="Microcosm", value = "coverage", -vOTU, -position, -base) %>%
+  mutate(bin = ceiling(position/1000)) %>%
+  group_by(vOTU, Microcosm, bin) %>%
+  summarize(mean_cov = mean(coverage),
+            sd_cov = sd(coverage)) %>%
+  as.data.frame %>%
+  mutate(position = bin*1000)
+
+
+SNPs4plot = SNPs.long %>%
+  filter(SNP == 1)
+
+
+ggplot(data=min_BbB_cov.sum, aes(x=position, y=mean_cov, color=Microcosm)) +
+  geom_line() +
+  geom_vline(data=SNPs4plot, y=0, aes(xintercept = position), color="black") +
+  theme_bw() +
+  theme(legend.position = "none") +
+  facet_wrap(~Microcosm, scales = "free_y", ncol=2)
+```
+
+### Base-by-base coverage across entire metagenome and SNPs
+
+Now look at combined coverage within the entire metagenome.
+
+```{r}
+# get combined coverage
+BbB_cov_long.df = data.frame()
+for (i in seq(1, 13)){
+  sub.df = BbB_cov.df[c(1,2,3, 1+3*i, 2+3*i, 3+3*i)]
+  colnames(sub.df) = c("vOTU", "position", "ref_base", "coverage", "read_bases", "read_quality")
+  sub.df$Microcosm = as.character(read.depths$Microcosm)[i]
+  BbB_cov_long.df = rbind(BbB_cov_long.df, sub.df)
+}
+
+BbB_cov_comb.df = BbB_cov_long.df %>%
+  filter(coverage > 0) %>%
+  group_by(vOTU, position, ref_base) %>%
+  summarize(coverage = sum(coverage),
+            read_bases = paste0(read_bases, collapse = ""),
+            read_quality = paste0(read_quality, collapse = "")) %>%
+  as.data.frame
+
+BbB_cov_comb.df$n_match = lengths(regmatches(BbB_cov_comb.df$read_bases, gregexpr("\\.|\\,", BbB_cov_comb.df$read_bases)))
+
+# Add SNPs
+SNPs4plot.sum = SNPs4plot %>%
+  select(vOTU, position, SNP_base) %>%
+  unique() %>%
+  arrange(position)
+
+BbB_cov_comb.sum = BbB_cov_comb.df %>%
+  select(vOTU, position, ref_base, coverage, n_match) %>%
+  mutate(perc_match = n_match/coverage*100) %>%
+  left_join(SNPs4plot.sum) %>%
+  mutate(SNP_change = paste(ref_base, "->", SNP_base))
+
+# Plot
+ggplot(data=BbB_cov_comb.sum, aes(x=position, y=perc_match)) +
+  geom_line() +
+  geom_point(data=filter(BbB_cov_comb.sum, !(is.na(SNP_base))), aes(color=SNP_change)) +
+  theme_bw()
+
+```
+
+### Primer/Probe positions
+
+Now look at the positions of the primers and probes in regard to read diversity and coverage. We want an assay set with relatively high coverage and where most aligned reads match the consensus contig sequence. Probes were made using the IDT PrimerQuest tool.
+
+```{r, fig.height=4, fig.width=6}
+probes.df = read.table("/home/sam/FullCyc_metagenome/phage_assembly/probe_design/test_probes_IDT.txt", header=TRUE, sep="\t") %>%
+  mutate(End = Start + Length)
+
+probe_regions.sum = probes.df %>%
+  filter(Type == "Forward Primer") %>%
+  mutate(Region_start = Start-100,
+         Region_end = Start+Amplicon_length+100,
+         vOTU = "scaffold_15_c1") %>%
+  select(vOTU, AssaySet, Region_start, Region_end) %>%
+  full_join(BbB_cov_comb.sum, by="vOTU") %>%
+  mutate(Region_name = ifelse(position >= Region_start & position <= Region_end, as.character(AssaySet), "Outside")) %>%
+  filter(Region_name != "Outside")
+
+max_coverage = max(probe_regions.sum$coverage)
+probe_regions.sum$coverage_adj = (3*probe_regions.sum$coverage/max_coverage)+95
+
+probe_regions.plot = ggplot(data=probe_regions.sum, aes(x=position/1000, y=perc_match)) +
+  geom_line(color="black") +
+  geom_line(aes(y=coverage_adj), color="grey") +
+  geom_segment(data=probes.df, aes(x=Start/1000, xend=End/1000, color=Type), y=100, yend=100, size=2) +
+  labs(x="Position on contig (Kbp)", y="Percent of read bases matching consensus", color="Oligo type") +
+  scale_y_continuous("Percent of read bases matching consensus (%)", sec.axis = sec_axis(~ (. - 95)*max_coverage/3, name="Read coverage")) +
+  theme_bw() +
+  theme(legend.position = c(0.88, 0.25)) +
+  facet_wrap(~gsub(" \\(scaffold_15_c1\\)", "", AssaySet), scales = "free_x")
+probe_regions.plot
+
+#ggsave(probe_regions.plot, filename = "/home/sam/FullCyc_metagenome/phage_assembly/Figs4Publication/FigS3.tiff", 
+#       device = "tiff", width = 6, height = 4, units = "in")
+```
+
+### Primer and Probe alignment testing
+Lets see how well the primer and probe align to sequences within the metagenome. Hopefully the full set aligns only to the target contig.
+
+First check alignment to just the target contig sequence
+```{r}
+blastout_vOTU.df = read.table("/home/sam/FullCyc_metagenome/phage_assembly/probe_design/primer_probe_to_target_blastout.txt", header=FALSE, sep="\t", stringsAsFactors = FALSE)
+colnames(blastout_vOTU.df) = c("query_ID", "ref_ID", "perc_identity", "align_length", "mismatchs", "gaps", "qstart", "qend", "sstart", "send", "evalue", "bitscore")
+
+kable(blastout_vOTU.df %>%
+        arrange(evalue))
+```
+
+Now the alignment to all contigs. The set should only completely match scaffold_15_c1
+
+```{r}
+blastout_allcontigs.df = read.table("/home/sam/FullCyc_metagenome/phage_assembly/probe_design/primer_probe_to_contig_blastout.txt", 
+                                    header=FALSE, sep="\t", stringsAsFactors = FALSE)
+colnames(blastout_allcontigs.df) = c("query_ID", "ref_ID", "perc_identity", "align_length", "mismatchs", "gaps", "qstart", "qend", "sstart", "send", "evalue", "bitscore")
+
+kable(blastout_allcontigs.df %>%
+        arrange(ref_ID, evalue))
+```
+
+Now check the control oligo to make sure it matches the primer and probe
+```{r}
+blastout_conoligo.df = read.table("/home/sam/FullCyc_metagenome/phage_assembly/probe_design/primer_probe_to_controloligo_blastout.txt", 
+                                  header=FALSE, sep="\t", stringsAsFactors = FALSE)
+colnames(blastout_conoligo.df) = c("query_ID", "ref_ID", "perc_identity", "align_length", "mismatchs", "gaps", "qstart", "qend", "sstart", "send", "evalue", "bitscore")
+
+kable(blastout_conoligo.df %>%
+        arrange(evalue))
+```
+
+## rpoB OTU 1 labeling
+
+From the rpoB sequencing, we found the dominant OTU, OTU 1 showed a similar population dynamic to the main vOTU (scaffold_15_c1). To try to link that rpoB OTU to 13C-labeling I aligned the rpoB sequence to RefSeq genomes, two of which had 100% sequence identity. I then aligned the 16S OTUs from the original SIP study to these two genomes to identify the 16S OTUs that may represent this population (97% identity).
+
+```{r}
+blastout.df = read.table("/home/sam/FullCyc_metagenome/phage_assembly/rpoB_analysis/data/OTU_1_blasting/FullCyc_OTU_Streptomyces_blast_results", header=FALSE, sep="\t", stringsAsFactors = FALSE)
+colnames(blastout.df) = c("query_ID", "ref_ID", "perc_identity", "align_length", "mismatchs", "gaps", "qstart", "qend", "sstart", "send", "evalue", "bitscore")
+
+OTU_16S_lengths.df = read.table("/home/sam/FullCyc_metagenome/phage_assembly/rpoB_analysis/data/OTU_1_blasting/OTU_16S_lengths.txt", header=TRUE, sep="\t", stringsAsFactors = FALSE) %>%
+  rename(query_ID = OTU, query_length = seq_length)
+
+blastout.df = left_join(blastout.df, OTU_16S_lengths.df, by = "query_ID")
+
+kable(blastout.df %>%
+        filter(perc_identity > 97) %>%
+        arrange(-perc_identity, -align_length) %>%
+        rename(OTU = query_ID) %>%
+        inner_join(FullCyc1_incorp.df, by = "OTU") %>%
+        arrange(OTU, Substrate, Day, -perc_identity, ref_ID))
+
+```
+
+Now lets plot the 13C labeling of these matching 16S OTUs and the vOTU and the abundance of the 16S OTUs. Similar to what we did with all streptomyces before.
+```{r, fig.height=5, fig.width=7}
+#vOTU scaffold_15_c1	matches CRIPSR spacers on contig scaffold_5665499_c1 which is an unlabeled streptomyces acording to IMG
+
+scaffold_15_c1_labeling.df = filter(enr_contigs.df, contigName == "scaffold_15_c1") %>%
+  mutate(Substrate = gsub("Acid", " Acid", Substrate)) %>%
+  mutate(Substrate = factor(Substrate, levels=c("Glucose", "Xylose", "Amino Acids", "Glycerol", "Lactate", "Oxalate", "Vanillin", "Cellulose", "Palmitic Acid"))) %>%
+  select(Substrate, Day, contigName) %>%
+  arrange(Substrate, Day)
+
+Matching_OTUs_labeling.df = FullCyc1_incorp.df %>% 
+  filter(OTU %in% unique(filter(blastout.df, perc_identity > 97, query_length == align_length)$query_ID))
+
+Matching_OTUs_labeling.sum = Matching_OTUs_labeling.df %>%
+  group_by(Substrate, Day) %>%
+  summarize(n_OTU = n()) %>%
+  ungroup %>%
+  mutate(Substrate = gsub("Acid", " Acid", Substrate)) %>%
+  mutate(Substrate = factor(Substrate, levels=c("Glucose", "Xylose", "Amino Acids", "Glycerol", "Lactate", "Oxalate", "Vanillin", "Cellulose", "Palmitic Acid")))
+
+Matching_OTUs_growth.df = FullCyc1_growth.df %>%
+  filter(OTU %in% unique(filter(blastout.df, perc_identity > 97, query_length == align_length)$query_ID)) %>%
+  filter(OTU %in% Matching_OTUs_labeling.df$OTU)
+
+Matching_OTUs_growth.sum = Matching_OTUs_growth.df %>%
+  group_by(Day) %>%
+  summarize(sum_norm_abd = sum(norm_abundance)) %>%
+  as.data.frame
+
+meta_SIP_days.df = data.frame(Day = c(1, 6, 14, 14, 30, 30, 48, 48),
+                              Substrate = c("Glucose", "Xylose", "Glucose", "Glycerol", "Cellulose", "Palmitic Acid", "Palmitic Acid", "Vanillin"))
+
+
+MWHRSIP_sampled.df = rbind(data.frame(Substrate = "Glucose", Day = c(1,3,6,14)),
+                           data.frame(Substrate = "Xylose", Day = c(1,3,6,14)),
+                           data.frame(Substrate = "Amino Acids", Day = c(1,3,6,14)),
+                           data.frame(Substrate = "Glycerol", Day = c(1,3,6,14)),
+                           data.frame(Substrate = "Lactate", Day = c(1,3,6)),
+                           data.frame(Substrate = "Oxalate", Day = c(3,6,14)),
+                           data.frame(Substrate = "Vanillin", Day = c(6,14,30,48)),
+                           data.frame(Substrate = "Cellulose", Day = c(3,6,14,30,48)),
+                           data.frame(Substrate = "Palmitic Acid", Day = c(6,14,30,48))) %>%
+    mutate(Substrate = factor(Substrate, levels=c("Glucose", "Xylose", "Amino Acids", "Glycerol", "Lactate", "Oxalate", "Vanillin", "Cellulose", "Palmitic Acid")))
+
+
+nudge.df = data.frame(OTU = c("OTU.11", "OTU.12724", "OTU.24", "OTU.5772", "OTU.8626"),
+                      ynudge = c(0.3, 0.3, 0, -0.3, -0.3),
+                      xnudge = c(0.75, -0.75, 0, -0.75, 0.75))
+Matching_OTUs_labeling.df = left_join(Matching_OTUs_labeling.df, nudge.df, by="OTU")
+
+Matching_OTUs_labeling.plot = ggplot(data=Matching_OTUs_labeling.df, aes(x=Day, y=Substrate)) +
+  geom_point(data=MWHRSIP_sampled.df, shape=0, size=7, color="black") +
+  geom_point(data=scaffold_15_c1_labeling.df, shape=15, size=7, color="yellow") +
+  geom_point(data=meta_SIP_days.df, shape=0, size=7, color="red",stroke = 2) +
+  #geom_point(aes(fill=OTU), position = position_dodge(1), size=1, shape=21, color="black") +
+  geom_point(data=filter(Matching_OTUs_labeling.df, OTU == "OTU.11"), aes(fill=OTU), position = position_nudge(y=0.2, x=0.6), size=2, shape=21, color="black") +
+  geom_point(data=filter(Matching_OTUs_labeling.df, OTU == "OTU.12724"), aes(fill=OTU), position = position_nudge(y=0.2, x=-0.6), size=2, shape=21, color="black") +
+  geom_point(data=filter(Matching_OTUs_labeling.df, OTU == "OTU.24"), aes(fill=OTU), position = position_nudge(y=0, x=0), size=2, shape=21, color="black") +
+  geom_point(data=filter(Matching_OTUs_labeling.df, OTU == "OTU.5772"), aes(fill=OTU), position = position_nudge(y=-0.2, x=-0.6), size=2, shape=21, color="black") +
+  geom_point(data=filter(Matching_OTUs_labeling.df, OTU == "OTU.8626"), aes(fill=OTU), position = position_nudge(y=-0.2, x=0.6), size=2, shape=21, color="black") +
+  lims(x= c(0,50)) +
+  labs(x="Time since C addition (days)", y="<sup>13</sup>C-labeled C source", fill="Mapped OTU<sub>rRNA</sub>") +
+  scale_y_discrete(limits = rev(levels(Matching_OTUs_labeling.sum$Substrate))) +
+  scale_fill_manual(values = paultol_colors(length(unique(Matching_OTUs_growth.df$OTU)))) +
+  theme_bw() +
+  theme(axis.title.y = element_markdown(size=8),
+        axis.text.y = element_text(size=7),
+        axis.text.x = element_blank(),
+        axis.title.x = element_blank(),
+        legend.title = element_markdown(size=7),
+        legend.text = element_text(size=7),
+        legend.position = c(0.91, 0.67),
+        legend.direction = "vertical",
+        legend.background = element_blank(),
+        legend.box.background = element_rect(colour = "black")) +
+  guides(size = guide_legend(title.position="top", title.hjust = 0.5))
+
+Matching_OTUs_growth.plot = ggplot(data=Matching_OTUs_growth.df, aes(x=Day, y=norm_abundance, group=OTU)) +
+  geom_line(size=0.75, color="black") +
+  geom_line(aes(color=OTU), size=0.5) +
+  labs(x="Time since C addition (days)", y="Normalized abundance of<br>mapped OTU<sub>rRNA</sub>") +
+  lims(x= c(0,50)) +
+  scale_color_manual(values = paultol_colors(length(unique(Matching_OTUs_growth.df$OTU)))) +
+  theme_bw() +
+  theme(axis.title.x = element_text(size=8),
+        axis.title.y = element_markdown(size=8),
+        axis.text = element_text(size=7),
+        legend.position = c(0.60, 0.75),
+        legend.title = element_blank(),
+        legend.text = element_text(size=7),
+        legend.direction = "horizontal",
+        legend.background = element_blank(),
+        legend.box.background = element_rect(colour = "black"))
+
+fig_S2.plot = cowplot::plot_grid(Matching_OTUs_labeling.plot, Matching_OTUs_growth.plot, nrow=2, rel_heights = c(1, 0.8), align = "v", axis = "lr", labels = c("A", "B"), label_size = 9)
+fig_S2.plot
+
+#ggsave(fig_S2.plot, filename = "/home/sam/FullCyc_metagenome/phage_assembly/Figs4Publication/FigS2.tiff", 
+#       device = "tiff", width = 7, height = 5, units = "in")
+
+```
+
+## CheckV quality results
+
+I ran CheckV to get estimated quality of the vOTUs. Lets look at those here.
+```{r}
+CheckV_res.df = read.table("/home/sam/FullCyc_metagenome/phage_assembly/CheckV_output/quality_summary.tsv", header=TRUE,
+           sep="\t")
+
+kable(CheckV_res.df %>%
+        arrange(completeness))
+
+
+```
+
+
+## Supplemental datasets
+
+Here I'll write the dataset used as supplemental in the manuscript.
+```{r}
+supp_data1.df = full_join(CheckV_res.df %>% rename(vOTU = contig_id), 
+                          vOTUs_vContact2.df %>% rename(vOTU = contigName),
+                          by = "vOTU") %>%
+  left_join(VirSorter_vOTUs.df %>% rename(vOTU = contigName, VirSorter_gene_count = Nb.genes,
+                                          VirSorter_category = Category, 
+                                          VirSorter_hallmark_gene_count = Nb.phage.hallmark.genes) %>%
+              mutate(Treatment = paste(Substrate, "day", Day, sep=" "),
+                     VirSorter_hallmark_gene_count = as.numeric(as.character(VirSorter_hallmark_gene_count)),
+                     VirSorter_gene_count = as.numeric(as.character(VirSorter_gene_count))) %>%
+              group_by(vOTU, VirSorter_gene_count, VirSorter_category, VirSorter_hallmark_gene_count) %>%
+              summarize(Labeled_treatments = paste(Treatment, collapse=", ")) %>%
+              ungroup, by = "vOTU") %>%
+  mutate(gene_count_diff = VirSorter_gene_count-gene_count)
+
+#write.table(supp_data1.df, file="/home/sam/FullCyc_metagenome/phage_assembly/Figs4Publication/suppl_dataset.txt", sep="\t", quote=FALSE, row.names = FALSE)
+
+```
+
+# DRAM-v
+
+I also ran DRAM-v to identify auxilliary metabolig genes in these vOTU. Lets look at those results here.
+```{r}
+vOTU_count.sum = VirSorter_vOTUs.df %>%
+  group_by(Substrate, Day) %>%
+  summarize(n_vOTU = n()) %>%
+  ungroup %>%
+  mutate(Treatment = factor(paste(gsub("Acid", " Acid", Substrate), "Day", Day), levels=treatment_levels))
+
+amg_summary.df = read.table("/home/sam/FullCyc_metagenome/phage_assembly/vOTU_DRAM/annotation/distilled/amg_summary.tsv", 
+                            sep="\t", header=TRUE, comment.char = "", quote = "") %>%
+  mutate(contigName = gsub("-.*", "", gsub("VIRSorter_", "", scaffold))) %>%
+  left_join(VirSorter_vOTUs.df, by = "contigName") %>%
+  left_join(treat.read.depths, by = c("Substrate", "Day"))
+amg_summary.df[amg_summary.df == ""] = NA
+
+amg_summary.sum = amg_summary.df %>%
+  group_by(Substrate, Day, category) %>%
+  summarize(n_AMG = n()) %>%
+  ungroup %>%
+  full_join(treat.read.depths, by = c("Substrate", "Day")) %>%
+  mutate(rel_n_AMG = n_AMG*1000000/n_reads,
+         Treatment = factor(paste(gsub("Acid", " Acid", Substrate), "Day", Day), levels=treatment_levels)) %>%
+  left_join(vOTU_count.sum) %>%
+  mutate(AMG_per_vOTU = n_AMG/n_vOTU)
+  
+ggplot(data=amg_summary.sum, aes(x=Treatment, y=n_AMG, fill=category)) +
+  geom_bar(stat = "identity")
+
+ggplot(data=amg_summary.sum, aes(x=Treatment, y=rel_n_AMG, fill=category)) +
+  geom_bar(stat = "identity")
+
+ggplot(data=amg_summary.sum, aes(x=Treatment, y=AMG_per_vOTU, fill=category)) +
+  geom_bar(stat = "identity")
+
+vMAG_stats.df = read.table("/home/sam/FullCyc_metagenome/phage_assembly/vOTU_DRAM/annotation/distilled/vMAG_stats.tsv", sep="\t", header=TRUE, comment.char = "") %>%
+  mutate(contigName = gsub("-.*", "", gsub("VIRSorter_", "", X)))
+
+AMG_count.sum = left_join(vMAG_stats.df, VirSorter_vOTUs.df, by = "contigName") %>%
+  filter(potential.AMG.count > 0) %>%
+  group_by(Substrate, Day) %>%
+  summarize(n_AMG_vOTU = n()) %>%
+  ungroup %>%
+  full_join(treat.read.depths, by = c("Substrate", "Day")) %>%
+  mutate(rel_n_AMG_vOTU = n_AMG_vOTU*1000000/n_reads,
+         Treatment = factor(paste(gsub("Acid", " Acid", Substrate), "Day", Day), levels=treatment_levels))
+
+kable(AMG_count.sum)
+
+```
+
+
