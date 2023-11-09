@@ -1,7 +1,7 @@
 # Metagenomic stable isotope probing reveals bacteriophages involved in soil carbon cycling
 Analysis and data from a study using metagenomic-SIP to examine soil phages and the soil carbon cycle.
 
-Barnett, S.E. & Buckley, D.H. (2023) Metagenomic stable isotope probing reveals bacteriophage participation in soil carbon cycling. *Environmental Microbiology*, 1–11. https://doi.org/10.1111/1462-2920.16395
+Barnett, S.E. & Buckley, D.H. (2023) Metagenomic stable isotope probing reveals bacteriophage participation in soil carbon cycling. *Environmental Microbiology*, 25:1785–1795. https://doi.org/10.1111/1462-2920.16395
 
 ## Files
 
